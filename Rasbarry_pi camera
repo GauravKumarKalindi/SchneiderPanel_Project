@@ -1,0 +1,360 @@
+import time
+import os
+import threading
+import subprocess
+import socket
+import telepot
+import RPi.GPIO as GPIO
+from telepot.loop import MessageLoop
+from telepot.namedtuple import InlineKeyboardMarkup, InlineKeyboardButton
+from picamera import PiCamera
+from flask import Flask, render_template, Response, request
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('SchneiderVision')
+
+# GPIO setup
+PIR = 4
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PIR, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Use internal pull-up resistor
+
+# Camera setup
+camera = PiCamera()
+camera.resolution = (640, 480)
+camera.framerate = 25
+
+# Telegram setup
+BOT_TOKEN = '7204197704:AAFVQIarch_m9-L1lR18ZWYLmTWE4_5woqQ'
+CHAT_ID = '5056204979'
+bot = telepot.Bot(BOT_TOKEN)
+
+# Flask app
+app = Flask(__name__)
+
+# Global variables
+stream_active = False
+motion_active = False
+stream_timer = None
+camera_lock = threading.Lock()
+last_frame = None
+
+# Get IP address
+def get_ip_address():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't need to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+class StreamingCamera:
+    def __init__(self, flip=False):
+        self.flip = flip
+        self.streaming = False
+        
+    def start_stream(self):
+        with camera_lock:
+            self.streaming = True
+
+    def stop_stream(self):
+        with camera_lock:
+            self.streaming = False
+
+    def get_frame(self):
+        global last_frame
+        if not self.streaming:
+            return last_frame
+        
+        with camera_lock:
+            # Create an in-memory stream
+            frame = None
+            try:
+                import io
+                stream = io.BytesIO()
+                camera.capture(stream, format='jpeg', use_video_port=True)
+                stream.seek(0)
+                frame = stream.read()
+                last_frame = frame
+            except Exception as e:
+                logger.error(f"Error capturing frame: {e}")
+                if last_frame:
+                    frame = last_frame
+                else:
+                    # Return a blank frame
+                    frame = b''
+        
+        return frame
+
+# Initialize camera
+streaming_camera = StreamingCamera(flip=False)
+
+# Flask routes
+@app.route('/')
+def index():
+    # Full-screen HTML page with video stream
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>SchneiderVision Live Stream</title>
+        <style>
+            body, html {
+                margin: 0;
+                padding: 0;
+                height: 100%;
+                overflow: hidden;
+                background: #000;
+            }
+            .container {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+            }
+            .header {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                background-color: rgba(0, 0, 0, 0.7);
+                color: white;
+                text-align: center;
+                padding: 10px 0;
+                z-index: 10;
+            }
+            .video-container {
+                width: 100%;
+                height: 100%;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
+            .video-feed {
+                max-width: 100%;
+                max-height: 100%;
+                width: auto;
+                height: auto;
+                object-fit: contain;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>SchneiderVision Live Stream</h1>
+            </div>
+            <div class="video-container">
+                <img src="/video_feed" class="video-feed" />
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+    return html
+
+def gen_frames():
+    while True:
+        frame = streaming_camera.get_frame()
+        if frame:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+        else:
+            time.sleep(0.1)  # Prevent CPU overload if no frame
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# Motion detection function
+def start_motion_detection():
+    global motion_active
+    logger.info("Starting motion detection")
+    motion_active = True
+    
+    while motion_active:
+        if GPIO.input(PIR) == GPIO.LOW:  # Motion detected
+            logger.info("Motion detected!")
+            with camera_lock:
+                if motion_active:  # Double-check we're still in motion mode
+                    filename = f"/tmp/motion_{time.strftime('%Y%m%d_%H%M%S')}"
+                    camera.start_recording(f"{filename}.h264")
+                    time.sleep(5)
+                    camera.stop_recording()
+                    
+                    # Convert to MP4
+                    try:
+                        subprocess.call(f"MP4Box -add {filename}.h264 {filename}.mp4", shell=True)
+                        
+                        # Send video to Telegram
+                        with open(f"{filename}.mp4", 'rb') as video:
+                            bot.sendVideo(CHAT_ID, video=video)
+                        bot.sendMessage(CHAT_ID, 'Motion detected!')
+                        
+                        # Clean up
+                        os.remove(f"{filename}.h264")
+                        os.remove(f"{filename}.mp4")
+                    except Exception as e:
+                        logger.error(f"Error processing video: {e}")
+        
+        time.sleep(1)
+    
+    logger.info("Motion detection stopped")
+
+# Stream timer function
+def stop_stream_after_timeout():
+    logger.info("Stream timeout timer started")
+    time.sleep(300)  # 5 minutes
+    
+    global stream_active
+    if stream_active:
+        logger.info("Stream timeout reached, stopping stream")
+        toggle_stream_mode(auto_timeout=True)
+
+# Function to toggle between motion detection and streaming
+def toggle_stream_mode(auto_timeout=False):
+    global stream_active, motion_active, stream_timer
+    
+    if stream_active:
+        # Stop streaming, start motion detection
+        logger.info("Stopping stream, starting motion detection")
+        streaming_camera.stop_stream()
+        stream_active = False
+        
+        # Cancel the timer if it exists
+        if stream_timer and stream_timer.is_alive():
+            # We can't actually cancel the thread, but we'll ignore it when it completes
+            pass
+        
+        # Start motion detection in a new thread
+        motion_thread = threading.Thread(target=start_motion_detection)
+        motion_thread.daemon = True
+        motion_thread.start()
+        
+        # Update Telegram message
+        if not auto_timeout:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Start Live Stream", callback_data="start_stream")]
+            ])
+            bot.sendMessage(CHAT_ID, "Live stream stopped. Motion detection mode activated.", reply_markup=keyboard)
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Start Live Stream", callback_data="start_stream")]
+            ])
+            bot.sendMessage(CHAT_ID, "Live stream timed out after 5 minutes. Motion detection mode activated.", reply_markup=keyboard)
+    
+    else:
+        # Stop motion detection, start streaming
+        logger.info("Stopping motion detection, starting stream")
+        motion_active = False
+        time.sleep(1)  # Give motion detection thread time to stop
+        
+        # Start streaming
+        streaming_camera.start_stream()
+        stream_active = True
+        
+        # Start the timeout timer
+        stream_timer = threading.Thread(target=stop_stream_after_timeout)
+        stream_timer.daemon = True
+        stream_timer.start()
+        
+        # Send message with IP
+        ip_address = get_ip_address()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Stop Live Stream", callback_data="stop_stream")]
+        ])
+        bot.sendMessage(
+            CHAT_ID, 
+            f"Motion detection stopped. Live stream started!\nAccess at: http://{ip_address}:5000", 
+            reply_markup=keyboard
+        )
+
+# Telegram message handler
+def handle_message(msg):
+    global CHAT_ID
+    
+    content_type, chat_type, chat_id = telepot.glance(msg)
+    CHAT_ID = chat_id
+    
+    if content_type == 'text':
+        if msg['text'] == '/start':
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Start Live Stream", callback_data="start_stream")]
+            ])
+            bot.sendMessage(
+                chat_id, 
+                f"Hello! SchneiderVision has booted successfully.\n"
+                f"Your assigned IP address is: {get_ip_address()}\n"
+                f"Motion detection mode is active by default.\n"
+                f"Use the button below to start live stream.",
+                reply_markup=keyboard
+            )
+
+# Telegram callback handler for buttons
+def handle_callback(msg):
+    query_id, chat_id, query_data = telepot.glance(msg, flavor='callback_query')
+    
+    if query_data == "start_stream":
+        if not stream_active:
+            toggle_stream_mode()
+    
+    elif query_data == "stop_stream":
+        if stream_active:
+            toggle_stream_mode()
+
+# Start Flask in a separate thread
+def start_flask():
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+def main():
+    # Set up Telegram handlers
+    MessageLoop(bot, {'chat': handle_message,
+                      'callback_query': handle_callback}).run_as_thread()
+    
+    # Send boot message
+    ip_address = get_ip_address()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Start Live Stream", callback_data="start_stream")]
+    ])
+    bot.sendMessage(
+        CHAT_ID, 
+        f"Hello! SchneiderVision has booted successfully.\n"
+        f"Your assigned IP address is: {ip_address}\n"
+        f"Motion detection mode is active by default.\n"
+        f"Use the button below to start live stream.",
+        reply_markup=keyboard
+    )
+    
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=start_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Start in motion detection mode by default
+    motion_thread = threading.Thread(target=start_motion_detection)
+    motion_thread.daemon = True
+    motion_thread.start()
+    
+    # Keep the main thread running
+    while True:
+        try:
+            time.sleep(10)
+        except KeyboardInterrupt:
+            print("Shutting down...")
+            GPIO.cleanup()
+            break
+
+if __name__ == '__main__':
+    main()
