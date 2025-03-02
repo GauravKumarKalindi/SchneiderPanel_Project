@@ -1,0 +1,141 @@
+ESP 32 AUTOMATION KIT CODE :
+#define BLYNK_TEMPLATE_ID "TMPL399kfFj0p"
+#define BLYNK_TEMPLATE_NAME "esp32"
+#define BLYNK_AUTH_TOKEN "lEUDw2IFCjVatNbOAHd3VX2Cj7gk7I6T"
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <BlynkSimpleEsp32.h>
+
+#define relay1 13
+#define relay2 12
+#define relay3 14
+#define relay4 27
+#define relay5 26
+#define relay6 25
+#define relay7 33
+#define relay8 32
+#define relay9 15
+#define relay10 2
+#define relay11 4
+#define relay12 5
+#define relay13 18
+#define relay14 19
+#define relay15 21
+#define relay16 23
+
+int relays[] = {
+  relay1, relay2, relay3, relay4, relay5, relay6, relay7, relay8,
+  relay9, relay10, relay11, relay12, relay13, relay14, relay15, relay16
+};
+int numRelays = sizeof(relays) / sizeof(int);
+
+#define RESET_PIN 34
+#define RESET_TIMEOUT 10000 // 10 seconds
+
+WiFiManager wifiManager;
+unsigned long resetTimer = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Set relay pins as output and ensure they are off by default
+  for (int i = 0; i < numRelays; i++) {
+    pinMode(relays[i], OUTPUT);
+    digitalWrite(relays[i], HIGH); // Ensure all relays are off initially (HIGH)
+  }
+
+  pinMode(RESET_PIN, INPUT_PULLUP);
+
+  // WiFiManager for Wi-Fi setup
+  wifiManager.autoConnect("ScheiderPannel1");
+
+  // Blynk setup
+  Blynk.config(BLYNK_AUTH_TOKEN); // Initialize Blynk with the auth token
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi connected");
+  Blynk.connect(); // Connect to Blynk
+
+  Serial.println("Setup complete. Connected to Wi-Fi and Blynk.");
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  } else {
+    Serial.println("Wi-Fi disconnected, attempting to reconnect...");
+    WiFi.reconnect();
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("\nWi-Fi reconnected");
+    Blynk.connect();
+  }
+
+  // Check for Wi-Fi reset condition
+  if (digitalRead(RESET_PIN) == LOW) {
+    if (resetTimer == 0) {
+      resetTimer = millis();
+    } else if (millis() - resetTimer >= RESET_TIMEOUT) {
+      Serial.println("Wi-Fi reset triggered");
+      wifiManager.resetSettings();
+      ESP.restart();
+    }
+  } else {
+    resetTimer = 0;
+  }
+}
+
+// Blynk virtual pin handlers for controlling relays (V1 to V16)
+BLYNK_WRITE(V1) {
+  digitalWrite(relay1, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V2) {
+  digitalWrite(relay2, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V3) {
+  digitalWrite(relay3, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V4) {
+  digitalWrite(relay4, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V5) {
+  digitalWrite(relay5, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V6) {
+  digitalWrite(relay6, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V7) {
+  digitalWrite(relay7, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V8) {
+  digitalWrite(relay8, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V9) {
+  digitalWrite(relay9, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V10) {
+  digitalWrite(relay10, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V11) {
+  digitalWrite(relay11, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V12) {
+  digitalWrite(relay12, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V13) {
+  digitalWrite(relay13, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V14) {
+  digitalWrite(relay14, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V15) {
+  digitalWrite(relay15, param.asInt() ? LOW : HIGH);
+}
+BLYNK_WRITE(V16) {
+  digitalWrite(relay16, param.asInt() ? LOW : HIGH);
+}
